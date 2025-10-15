@@ -3,10 +3,11 @@ from __future__ import annotations
 import csv
 import json
 import sqlite3
+from collections import Counter
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Iterable, Iterator, Protocol
+from typing import Callable, Iterable, Iterator, Protocol
 
 from ..forms import ParsedFilters
 
@@ -27,6 +28,19 @@ class Message:
     content: str
     file_path: str
     metadata: dict[str, str] = field(default_factory=dict)
+    conversation: str = ""
+    direction: str = "unknown"
+
+    def __post_init__(self) -> None:
+        base = self.talker.strip() if self.talker else ""
+        sender = self.sender.strip() if self.sender else ""
+        if not base and sender:
+            base = sender
+        self.talker = base or sender
+        self.sender = sender or base
+        self.conversation = (self.conversation or self.talker or self.sender or "").strip()
+        if self.direction == "unknown":
+            self.direction = _infer_direction(self.metadata.get("is_send"))
 
     def to_dict(self) -> dict[str, object]:
         return {
@@ -37,6 +51,8 @@ class Message:
             "content": self.content,
             "file_path": self.file_path,
             "metadata": self.metadata,
+            "conversation": self.conversation,
+            "direction": self.direction,
         }
 
 
@@ -50,12 +66,30 @@ class ExtractionStats:
     contacts_found: list[str]
     earliest_timestamp: str | None
     latest_timestamp: str | None
+    top_contacts: list[dict[str, object]]
+    message_type_breakdown: list[dict[str, object]]
+    daily_breakdown: list[dict[str, object]]
 
 
 @dataclass
 class ExtractionResult:
     messages: list[Message]
     stats: ExtractionStats
+    grouped_threads: list["ConversationGroup"]
+
+
+@dataclass
+class ConversationGroup:
+    name: str
+    count: int
+    messages: list[Message]
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "name": self.name,
+            "count": self.count,
+            "messages": [message.to_dict() for message in self.messages],
+        }
 
 
 class Parser(Protocol):
@@ -85,6 +119,15 @@ class JSONParser:
             sender = str(item.get("sender") or item.get("from") or talker)
             message_type = str(item.get("message_type") or item.get("type") or "text")
             content = str(item.get("content") or item.get("body") or "")
+            direction_source = (
+                item.get("direction")
+                or item.get("is_send")
+                or item.get("issend")
+                or item.get("isSend")
+            )
+            metadata = {"index": str(index)}
+            if direction_source is not None:
+                metadata["is_send"] = str(direction_source)
             yield Message(
                 talker=talker,
                 sender=sender,
@@ -92,7 +135,9 @@ class JSONParser:
                 message_type=message_type.lower(),
                 content=content,
                 file_path=str(path),
-                metadata={"index": str(index)},
+                metadata=metadata,
+                conversation=str(item.get("conversation") or talker or sender),
+                direction=_infer_direction(direction_source),
             )
 
 
@@ -115,6 +160,8 @@ class TextParser:
                     content=body,
                     file_path=str(path),
                     metadata={"line": str(index + 1)},
+                    conversation=talker or sender,
+                    direction="unknown",
                 )
 
 
@@ -156,12 +203,20 @@ class SQLiteParser:
                 message_type = record.get("type")
                 content = record.get("strContent") or ""
                 timestamp = _coerce_sqlite_timestamp(record.get("createTime"))
+                direction_source = (
+                    record.get("isSend")
+                    or record.get("issend")
+                    or record.get("is_send")
+                    or record.get("IsSend")
+                )
                 metadata = {
                     key: str(value)
                     for key, value in record.items()
                     if key not in {"talker", "createTime", "type", "strContent", "sender"}
                     and value is not None
                 }
+                if direction_source is not None:
+                    metadata.setdefault("is_send", str(direction_source))
                 yield Message(
                     talker=talker,
                     sender=sender,
@@ -170,6 +225,8 @@ class SQLiteParser:
                     content=str(content),
                     file_path=str(path),
                     metadata=metadata,
+                    conversation=metadata.get("chatroom") or talker,
+                    direction=_infer_direction(direction_source),
                 )
         finally:
             connection.close()
@@ -201,6 +258,10 @@ class CSVParser:
                 message_type = row.get("message_type") or row.get("type") or "text"
                 content = row.get("content") or row.get("body") or ""
                 timestamp = _coerce_timestamp(row.get("timestamp"))
+                direction_source = row.get("direction") or row.get("is_send") or row.get("issend")
+                metadata = {"index": str(index)}
+                if direction_source is not None:
+                    metadata["is_send"] = str(direction_source)
                 yield Message(
                     talker=str(talker),
                     sender=str(sender),
@@ -208,7 +269,9 @@ class CSVParser:
                     message_type=str(message_type).lower(),
                     content=str(content),
                     file_path=str(path),
-                    metadata={"index": str(index)},
+                    metadata=metadata,
+                    conversation=row.get("conversation") or talker or sender,
+                    direction=_infer_direction(direction_source),
                 )
 
 
@@ -242,8 +305,8 @@ class ExtractionService:
             if parsed:
                 parsed_files += 1
                 for message in parsed:
-                    if message.talker:
-                        contacts.add(message.talker)
+                    if message.conversation:
+                        contacts.add(message.conversation)
                 all_messages.extend(parsed)
 
         if not all_messages:
@@ -255,6 +318,7 @@ class ExtractionService:
         matched_messages = self._apply_filters(all_messages, filters)
         matched_messages.sort(key=_message_sort_key, reverse=True)
         limited_messages = matched_messages[: filters.limit]
+        per_thread_limit = min(200, max(filters.limit, 50))
 
         stats = self._build_stats(
             all_messages=all_messages,
@@ -264,7 +328,12 @@ class ExtractionService:
             failed_files=failed_files,
             contacts=sorted(contacts),
         )
-        return ExtractionResult(messages=limited_messages, stats=stats)
+        grouped_threads = self._group_messages(
+            matched_messages,
+            per_thread_limit=per_thread_limit,
+            max_threads=20,
+        )
+        return ExtractionResult(messages=limited_messages, stats=stats, grouped_threads=grouped_threads)
 
     def _iter_files(self, base_dir: Path, recursive: bool) -> Iterator[Path]:
         if recursive:
@@ -292,11 +361,15 @@ class ExtractionService:
 
         def matches(message: Message) -> bool:
             if contacts_filter:
-                candidate = message.talker.lower()
-                if all(filter_value not in candidate for filter_value in contacts_filter):
+                haystack = " ".join(
+                    part
+                    for part in [message.conversation, message.talker, message.sender]
+                    if part
+                ).lower()
+                if all(filter_value not in haystack for filter_value in contacts_filter):
                     return False
             if message_types_filter:
-                if message.message_type.lower() not in message_types_filter:
+                if (message.message_type or "").lower() not in message_types_filter:
                     return False
             timestamp = _normalize_datetime(message.timestamp)
             if start and timestamp and timestamp < start:
@@ -306,6 +379,31 @@ class ExtractionService:
             return True
 
         return [message for message in messages if matches(message)]
+
+    def _group_messages(
+        self,
+        messages: list[Message],
+        *,
+        per_thread_limit: int = 50,
+        max_threads: int = 20,
+    ) -> list[ConversationGroup]:
+        grouped: dict[str, list[Message]] = {}
+        for message in messages:
+            key = message.conversation or message.talker or message.sender or "未命名会话"
+            grouped.setdefault(key, []).append(message)
+
+        sorted_groups = sorted(grouped.items(), key=lambda item: (-len(item[1]), item[0].lower()))
+        produced: list[ConversationGroup] = []
+        per_thread_limit = max(per_thread_limit, 1)
+        for name, group_messages in sorted_groups[:max_threads]:
+            ordered = sorted(
+                group_messages,
+                key=lambda msg: _normalize_datetime(msg.timestamp)
+                or datetime.fromtimestamp(0, tz=DEFAULT_TIMEZONE),
+            )
+            trimmed = ordered[-per_thread_limit:]
+            produced.append(ConversationGroup(name=name, count=len(group_messages), messages=trimmed))
+        return produced
 
     def _build_stats(
         self,
@@ -320,6 +418,19 @@ class ExtractionService:
         timestamps = [message.timestamp for message in all_messages if message.timestamp]
         earliest = min(timestamps).isoformat() if timestamps else None
         latest = max(timestamps).isoformat() if timestamps else None
+
+        contact_counter: Counter[str] = Counter(
+            message.conversation for message in all_messages if message.conversation
+        )
+        type_counter: Counter[str] = Counter(
+            (message.message_type or "unknown").lower() for message in all_messages
+        )
+        daily_counter: Counter[str] = Counter()
+        for message in all_messages:
+            normalized = _normalize_datetime(message.timestamp)
+            if normalized:
+                daily_counter[normalized.date().isoformat()] += 1
+
         return ExtractionStats(
             total_messages=len(all_messages),
             matched_messages=len(matched_messages),
@@ -329,6 +440,9 @@ class ExtractionService:
             contacts_found=contacts,
             earliest_timestamp=earliest,
             latest_timestamp=latest,
+            top_contacts=_format_counter(contact_counter, limit=10),
+            message_type_breakdown=_format_counter(type_counter, limit=None),
+            daily_breakdown=_format_counter(daily_counter, limit=None, sort_key=lambda item: item[0]),
         )
 
 
@@ -409,3 +523,34 @@ def _normalize_datetime(value: datetime | None) -> datetime | None:
     if value.tzinfo is None:
         return value.replace(tzinfo=DEFAULT_TIMEZONE)
     return value.astimezone(DEFAULT_TIMEZONE)
+
+
+def _format_counter(
+    counter: Counter[str], *, limit: int | None, sort_key: Callable[[tuple[str, int]], object] | None = None
+) -> list[dict[str, object]]:
+    items = list(counter.items())
+    if not items:
+        return []
+    if sort_key:
+        items.sort(key=sort_key)
+    else:
+        items.sort(key=lambda pair: (-pair[1], pair[0]))
+    if limit is not None:
+        items = items[:limit]
+    return [{"label": label, "count": count} for label, count in items]
+
+
+def _infer_direction(raw: object | None) -> str:
+    if raw is None:
+        return "unknown"
+    if isinstance(raw, bool):
+        return "outgoing" if raw else "incoming"
+    if isinstance(raw, (int, float)):
+        return "outgoing" if int(raw) == 1 else "incoming"
+    if isinstance(raw, str):
+        normalized = raw.strip().lower()
+        if normalized in {"1", "true", "sent", "out", "outgoing", "self"}:
+            return "outgoing"
+        if normalized in {"0", "false", "received", "in", "incoming", "other"}:
+            return "incoming"
+    return "unknown"
