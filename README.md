@@ -1,0 +1,2 @@
+# wechat_abstractor
+可以根据提供的本地文件提取微信聊天记录
