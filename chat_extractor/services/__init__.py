@@ -1,6 +1,7 @@
 """Service layer for WeChat chat extraction."""
 
 from .extractor import (
+	ConversationDay,
 	ConversationGroup,
 	ExtractionError,
 	ExtractionResult,
@@ -9,6 +10,7 @@ from .extractor import (
 )
 
 __all__ = [
+	"ConversationDay",
 	"ConversationGroup",
 	"ExtractionError",
 	"ExtractionResult",

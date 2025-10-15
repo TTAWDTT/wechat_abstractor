@@ -35,6 +35,7 @@ class ParsedFilters:
     end_time: datetime | None
     message_types: list[str]
     include_subdirectories: bool
+    wechat_db_key: str | None = None
 
 
 class ExtractionForm(forms.Form):
@@ -104,6 +105,14 @@ class ExtractionForm(forms.Form):
         required=False,
         initial=True,
     )
+    wechat_db_key = forms.CharField(
+        label="数据库密钥 (可选)",
+        required=False,
+        help_text="当数据库为 SQLCipher 加密时，可直接输入 64 位十六进制密钥。留空将尝试自动获取。",
+        widget=forms.TextInput(
+            attrs={"placeholder": "82b1a2…", "class": "form-control"}
+        ),
+    )
 
     def clean_base_dir(self) -> str:
         raw_path = self.cleaned_data["base_dir"].strip()
@@ -148,4 +157,5 @@ class ExtractionForm(forms.Form):
             end_time=self.cleaned_data.get("end_time"),
             message_types=self.get_message_types(),
             include_subdirectories=self.cleaned_data.get("include_subdirectories", True),
+            wechat_db_key=self.cleaned_data.get("wechat_db_key") or None,
         )

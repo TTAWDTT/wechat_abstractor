@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from dataclasses import asdict
 from datetime import datetime
 from io import StringIO
@@ -10,6 +11,7 @@ from django.shortcuts import render
 from django.views.decorators.http import require_http_methods
 
 from .forms import ExtractionForm
+from .services import wechat_crypto, wechat_process
 from .services.extractor import ExtractionError, ExtractionService
 
 SERVICE = ExtractionService()
@@ -24,6 +26,10 @@ def index(request: HttpRequest) -> HttpResponse:
         "stats": None,
         "threads": [],
         "error": None,
+        "detected_keys": [],
+        "sqlcipher_ready": wechat_crypto.HAS_PYCRYPTODOME,
+        "is_windows": os.name == "nt",
+        "has_psutil": wechat_process.HAS_PSUTIL,
     }
 
     if request.method == "POST":
@@ -41,6 +47,8 @@ def index(request: HttpRequest) -> HttpResponse:
             context["error"] = "表单校验失败，请检查输入项。"
     else:
         context["results"] = []
+
+    context["detected_keys"] = SERVICE.available_wechat_keys()
 
     return render(request, "chat_extractor/index.html", context)
 
@@ -91,12 +99,13 @@ def export_text(request: HttpRequest) -> HttpResponse:
         buffer.write(f"=== 会话: {group.name} ({group.count} 条消息) ===\n")
         for message in group.messages:
             timestamp = _format_timestamp(message.timestamp)
-            content = (message.content or "").replace("\r", "").replace("\n", " ")
+            content = (message.display_content or "").replace("\r", "").replace("\n", " ")
             direction = {
                 "outgoing": "(发出)",
                 "incoming": "(接收)",
             }.get(message.direction, "")
-            buffer.write(f"[{timestamp}] {message.sender}{direction}: {content}\n")
+            label = message.display_type or message.message_type
+            buffer.write(f"[{timestamp}] {message.sender}{direction} [{label}]: {content}\n")
 
     filename = datetime.now().strftime("wechat_export_%Y%m%d_%H%M%S.txt")
     response = HttpResponse(buffer.getvalue(), content_type="text/plain; charset=utf-8")
