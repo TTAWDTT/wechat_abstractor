@@ -1,0 +1,8 @@
+.card pre {
+    font-size: 0.85rem;
+}
+
+.table-responsive {
+    max-height: 65vh;
+    overflow-y: auto;
+}
